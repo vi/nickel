@@ -220,7 +220,7 @@ impl<EC: EvalCache> Program<EC> {
         let mut cache = Cache::new(ErrorTolerance::Strict);
 
         let main_id = match input {
-            Input::Path(path) => cache.add_file(path)?,
+            Input::Path(path) => cache.add_file(path, InputFormat::Nickel)?,
             Input::Source(source, name) => {
                 let path = PathBuf::from(name.into());
                 cache.add_source(SourcePath::Path(path), source)?

@@ -32,7 +32,7 @@ use std::time::SystemTime;
 use void::Void;
 
 /// Supported input formats.
-#[derive(Default, Clone, Copy, Eq, Debug, PartialEq)]
+#[derive(Default, Clone, Copy, Eq, Debug, PartialEq, PartialOrd, Ord)]
 pub enum InputFormat {
     #[default]
     Nickel,
@@ -203,6 +203,7 @@ enum SourceKind {
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Copy, Clone)]
 pub struct NameIdEntry {
     id: FileId,
+    format: InputFormat,
     source: SourceKind,
 }
 
@@ -356,7 +357,7 @@ pub enum ResolvedTerm {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourceState {
-    UpToDate(FileId),
+    UpToDate(FileId, InputFormat),
     /// The source is stale because it came from a file on disk that has since been updated.
     /// The data is the timestamp of the new version of the file.
     Stale(SystemTime),
@@ -390,7 +391,7 @@ impl Cache {
 
     /// Same as [Self::add_file], but assume that the path is already normalized, and take the
     /// timestamp as a parameter.
-    fn add_file_(&mut self, path: PathBuf, timestamp: SystemTime) -> io::Result<FileId> {
+    fn add_file_(&mut self, path: PathBuf, format: InputFormat, timestamp: SystemTime) -> io::Result<FileId> {
         let contents = std::fs::read_to_string(&path)?;
         let file_id = self.files.add(&path, contents);
         self.file_paths
@@ -399,6 +400,7 @@ impl Cache {
             SourcePath::Path(path),
             NameIdEntry {
                 id: file_id,
+                format,
                 source: SourceKind::Filesystem(timestamp),
             },
         );
@@ -409,23 +411,28 @@ impl Cache {
     ///
     /// Uses the normalized path and the *modified at* timestamp as the name-id table entry.
     /// Overrides any existing entry with the same name.
-    pub fn add_file(&mut self, path: impl Into<OsString>) -> io::Result<FileId> {
+    pub fn add_file(&mut self, path: impl Into<OsString>, format: InputFormat) -> io::Result<FileId> {
         let path = path.into();
         let timestamp = timestamp(&path)?;
         let normalized = normalize_path(&path)?;
-        self.add_file_(normalized, timestamp)
+        self.add_file_(normalized, format, timestamp)
     }
 
     /// Try to retrieve the id of a file from the cache.
     ///
     /// If it was not in cache, try to read it from the filesystem and add it as a new entry.
-    pub fn get_or_add_file(&mut self, path: impl Into<OsString>) -> io::Result<CacheOp<FileId>> {
+    pub fn get_or_add_file(&mut self, path: impl Into<OsString>, format: InputFormat) -> io::Result<CacheOp<FileId>> {
         let path = path.into();
         let normalized = normalize_path(&path)?;
         match self.id_or_new_timestamp_of(path.as_ref())? {
-            SourceState::UpToDate(id) => Ok(CacheOp::Cached(id)),
+            SourceState::UpToDate(id, cached_format) => {
+                if format != cached_format {
+                    return Err(std::io::ErrorKind::InvalidInput.into())
+                }
+                Ok(CacheOp::Cached(id))
+            }
             SourceState::Stale(timestamp) => {
-                self.add_file_(normalized, timestamp).map(CacheOp::Done)
+                self.add_file_(normalized, format, timestamp).map(CacheOp::Done)
             }
         }
     }
@@ -458,6 +465,7 @@ impl Cache {
             source_name,
             NameIdEntry {
                 id,
+                format: InputFormat::Nickel,
                 source: SourceKind::Memory,
             },
         );
@@ -483,6 +491,7 @@ impl Cache {
                 source_name,
                 NameIdEntry {
                     id: file_id,
+                    format: InputFormat::Nickel,
                     source: SourceKind::Memory,
                 },
             );
@@ -981,7 +990,7 @@ impl Cache {
     pub fn id_of(&self, name: &SourcePath) -> Option<FileId> {
         match name {
             SourcePath::Path(p) => match self.id_or_new_timestamp_of(p).ok()? {
-                SourceState::UpToDate(id) => Some(id),
+                SourceState::UpToDate(id, _format) => Some(id),
                 SourceState::Stale(_) => None,
             },
             name => Some(self.file_ids.get(name)?.id),
@@ -1001,19 +1010,21 @@ impl Cache {
             None => Ok(SourceState::Stale(timestamp(name)?)),
             Some(NameIdEntry {
                 id,
+                format,
                 source: SourceKind::Filesystem(ts),
             }) => {
                 let new_timestamp = timestamp(name)?;
                 if ts == &new_timestamp {
-                    Ok(SourceState::UpToDate(*id))
+                    Ok(SourceState::UpToDate(*id, *format))
                 } else {
                     Ok(SourceState::Stale(new_timestamp))
                 }
             }
             Some(NameIdEntry {
                 id,
+                format,
                 source: SourceKind::Memory,
-            }) => Ok(SourceState::UpToDate(*id)),
+            }) => Ok(SourceState::UpToDate(*id, *format)),
         }
     }
 
@@ -1381,7 +1392,7 @@ impl ImportResolver for Cache {
             .find_map(|parent| {
                 let mut path_buf = parent.clone();
                 path_buf.push(path);
-                self.get_or_add_file(&path_buf).ok().map(|x| (x, path_buf))
+                self.get_or_add_file(&path_buf, format).ok().map(|x| (x, path_buf))
             })
             .ok_or_else(|| {
                 let parents = possible_parents
